@@ -1,4 +1,4 @@
-"""decode — 오프라인 DBC 디코딩 (stdin 또는 파일 입력)"""
+"""decode — 오프라인 DBC 디코딩 (stdin 또는 파일 입력, conflict 정책 지원)"""
 
 import click
 
@@ -10,11 +10,14 @@ from ..core.output import emit
 @click.command("decode")
 @click.option("--dbc", "dbc_paths", multiple=True, required=True,
               help="DBC 경로, 복수 지정 가능")
+@click.option("--dbc-priority", "dbc_priority", default="later",
+              type=click.Choice(["later", "first", "error"]),
+              help="DBC frame_id 충돌 정책")
 @click.option("--input", "input_path", default=None,
               help="JSONL 입력 파일 (기본: stdin)")
-def decode(dbc_paths, input_path):
+def decode(dbc_paths, dbc_priority, input_path):
     """오프라인 DBC 디코딩. stdin 또는 파일 입력."""
-    decoder = DbcDecoder(dbc_paths)
+    decoder = DbcDecoder(dbc_paths, conflict_policy=dbc_priority)
 
     for record in read_jsonl(input_path):
         # frame 타입만 디코딩

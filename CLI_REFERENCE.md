@@ -8,6 +8,16 @@ No human-readable text is ever printed. Errors also go to stdout as JSON.
 - Exit code: `0` success, `1` error, `2` timeout
 - Every output line contains: `type`, `ts` (unix timestamp), `bus` (e.g. `"pcan:PCAN_USBBUS1"`)
 - `--dry-run` is available on all bus commands — runs full logic without hardware
+- `--pretty` global flag for human-readable colored output
+
+---
+
+## Global Options
+
+| Option | Description |
+|--------|-------------|
+| --pretty | Human-readable colored output (default: JSONL) |
+| --version | Show version |
 
 ---
 
@@ -50,12 +60,16 @@ canctl send --id ID --data DATA [options]
 | --data | **required** | Hex bytes, space-separated OK (e.g. "01 02 03" or "010203") |
 | --repeat | 1 | Send count (0 = infinite, Ctrl+C to stop) |
 | --interval | 0.0 | Interval between repeats in seconds |
+| --fd | false | CAN FD mode |
+| --data-bitrate | 0 | CAN FD data bitrate (0 = same as bitrate) |
 | --dry-run | false | Simulate without hardware |
 
 Output per frame:
 ```jsonl
 {"type":"send","ts":1710000000.1,"bus":"pcan:PCAN_USBBUS1","id":"0x201","ext":false,"dlc":8,"data":"0102030405060708","status":"ok"}
 ```
+
+CAN FD frame includes `"fd":true` field.
 
 Final:
 ```jsonl
@@ -66,7 +80,7 @@ Final:
 
 ### recv
 
-Receive CAN frames with ID filtering and optional DBC decoding.
+Receive CAN frames with queue-based architecture, ID filtering, and optional DBC decoding.
 
 ```
 canctl recv --id ID [--id ID ...] [options]
@@ -82,8 +96,13 @@ canctl recv --id ID [--id ID ...] [options]
 | --count | 0 | Stop after N frames (0 = infinite) |
 | --timeout | 0.0 | Timeout in seconds (0 = infinite) |
 | --dbc | none | DBC file path(s), multiple allowed |
+| --dbc-priority | later | DBC frame_id conflict policy: later / first / error |
 | --requires | none | Periodic send spec "ID:DATA:INTERVALms", multiple allowed |
+| --fd | false | CAN FD mode |
+| --data-bitrate | 0 | CAN FD data bitrate |
 | --dry-run | false | Simulate without hardware |
+
+Architecture: Dedicated recv thread → queue → main thread consume. Non-blocking.
 
 Output per frame:
 ```jsonl
@@ -106,7 +125,7 @@ Final:
 
 ### monitor
 
-Capture all bus traffic (raw, no decoding). Use `decode` command for post-processing.
+Capture all bus traffic (raw, no decoding). Thread-safe counters with rate calculation.
 
 ```
 canctl monitor [options]
@@ -123,6 +142,8 @@ canctl monitor [options]
 | --queue-size | 10000 | Internal queue size |
 | --overflow | ring | Queue overflow mode: drop / block / ring |
 | --requires | none | Periodic send spec "ID:DATA:INTERVALms" |
+| --fd | false | CAN FD mode |
+| --data-bitrate | 0 | CAN FD data bitrate |
 | --dry-run | false | Simulate without hardware |
 
 Output per frame:
@@ -132,7 +153,12 @@ Output per frame:
 
 Stats (if --stats-interval > 0):
 ```jsonl
-{"type":"stats","ts":1710000010.0,"bus":"pcan:PCAN_USBBUS1","total":8423,"dropped":0,"elapsed":10.0}
+{"type":"stats","ts":1710000010.0,"bus":"pcan:PCAN_USBBUS1","total":8423,"dropped":0,"rate_msg_s":842.3,"elapsed":10.0}
+```
+
+Real-time overflow warning (emitted every 5s when drops occur):
+```jsonl
+{"type":"warning","ts":...,"bus":"pcan:PCAN_USBBUS1","code":"QUEUE_OVERFLOW","message":"ring buffer overflow: 123 dropped, rate=1500.0 msg/s","dropped":123,"rate":1500.0}
 ```
 
 Final:
@@ -158,7 +184,13 @@ canctl decode --dbc PATH [--dbc PATH ...] [--input PATH]
 | Option | Default | Description |
 |--------|---------|-------------|
 | --dbc | **required** | DBC file path(s), multiple allowed |
+| --dbc-priority | later | DBC frame_id conflict policy: later / first / error |
 | --input | stdin | JSONL input file path |
+
+**DBC Conflict Policies:**
+- `later` (default): Later-loaded DBC overrides earlier on same frame_id
+- `first`: First-loaded DBC wins, later duplicates ignored with warning
+- `error`: Raise SIGNAL_CONFLICT error on any frame_id duplication
 
 Input: `type: "frame"` records with `id` and `data` fields.
 Non-frame records pass through unchanged.
@@ -192,6 +224,10 @@ canctl play INPUT_FILE [options]
 | --bitrate, -b | 500000 | Bitrate in bps |
 | --speed | 1.0 | Playback speed (2.0 = 2x, 0 = instant) |
 | --loop | false | Loop playback |
+| --jitter | 0.0 | Random ±jitter in milliseconds per frame |
+| --burst | 1 | Send each frame N times (burst mode) |
+| --fd | false | CAN FD mode |
+| --data-bitrate | 0 | CAN FD data bitrate |
 | --dry-run | false | Simulate without hardware |
 
 Output per frame:
@@ -216,13 +252,30 @@ Format: `ID:DATA:INTERVALms`
 --requires "0x300:FF00:50ms"         # Send 0xFF00 to 0x300 every 50ms
 ```
 
-Multiple `--requires` allowed. Managed by a single scheduler thread.
+Multiple `--requires` allowed.
+
+**Implementation strategy:**
+1. Try `bus.send_periodic()` (driver-level HW timer, e.g. PCAN HW timer)
+2. Fallback: per-job independent thread with drift compensation
 
 Events emitted:
 ```jsonl
-{"type":"periodic_start","ts":...,"bus":"pcan:PCAN_USBBUS1","id":"0x700","data":"00","interval_ms":100}
+{"type":"periodic_start","ts":...,"bus":"pcan:PCAN_USBBUS1","id":"0x700","data":"00","interval_ms":100,"mode":"hw"}
 {"type":"periodic_stop","ts":...,"bus":"pcan:PCAN_USBBUS1","id":"0x700"}
 ```
+
+`mode` field: `"hw"` = driver-level periodic, `"sw"` = software thread fallback.
+
+---
+
+## Bus Types
+
+| Type | Interface | Use Case |
+|------|-----------|----------|
+| Real bus | pcan/vector/kvaser | Production hardware |
+| DryRunBus | `--dry-run` | Logic testing without hardware |
+| VirtualBus | programmatic | LLM test automation (send → recv loopback) |
+| ReplayBus | programmatic | Replay from JSONL records |
 
 ---
 
@@ -238,9 +291,9 @@ Events emitted:
 | play | play | Replayed frame |
 | periodic_start | recv, monitor | Periodic send started |
 | periodic_stop | recv, monitor | Periodic send stopped |
-| stats | monitor | Periodic statistics |
+| stats | monitor | Periodic statistics (includes rate_msg_s) |
 | summary | all | Final summary on exit |
-| warning | monitor | Non-fatal issue (e.g. queue overflow) |
+| warning | monitor, recv | Non-fatal issue (e.g. queue overflow, DBC conflict) |
 | error | all | Error with code and message |
 
 ---
@@ -253,11 +306,38 @@ Events emitted:
 | TIMEOUT | No frame received within timeout |
 | SEND_FAIL | Frame send failed |
 | BUS_ERROR | CAN bus error |
+| BUS_OFF | CAN bus-off state (hardware error) |
+| ARB_LOST | CAN arbitration lost |
 | PERIODIC_FAIL | Periodic manager crashed |
 | DBC_PARSE_FAIL | DBC file parse error |
+| INVALID_DBC | Invalid DBC file format |
+| DECODE_ERROR | DBC signal decode failed for a frame |
+| SIGNAL_CONFLICT | DBC frame_id duplication detected |
 | INVALID_ARG | Invalid argument format |
 | QUEUE_OVERFLOW | Monitor queue overflow |
 | FILE_NOT_FOUND | Input file not found |
+
+---
+
+## Internal Message Schema
+
+All commands use a unified `CanFrame` dataclass internally:
+```json
+{
+  "type": "frame",
+  "ts": 1710000000.123456789,
+  "bus": "pcan:PCAN_USBBUS1",
+  "id": "0x201",
+  "ext": false,
+  "dlc": 8,
+  "data": "FF3C000000000000",
+  "fd": false
+}
+```
+
+- `ts`: float seconds (internal: nanosecond int for precision)
+- `fd`: only present when CAN FD is active
+- `id`: always hex string format "0x..."
 
 ---
 
@@ -290,17 +370,32 @@ canctl play session.jsonl --dry-run --speed 0 \
   | canctl decode --dbc engine.dbc
 ```
 
-### 5. Bug reproduction at half speed
+### 5. Bug reproduction at half speed with jitter
 ```bash
-canctl play bug_session.jsonl --speed 0.5 --loop
+canctl play bug_session.jsonl --speed 0.5 --jitter 5 --loop
 ```
 
-### 6. Send single command frame
+### 6. Stress test with burst replay
+```bash
+canctl play session.jsonl --speed 0 --burst 10 --dry-run
+```
+
+### 7. Send CAN FD frame
+```bash
+canctl send --id 0x201 --data "0102030405060708090A0B0C" --fd --data-bitrate 2000000
+```
+
+### 8. Multi-DBC decode with priority
+```bash
+canctl decode --dbc oem.dbc --dbc custom.dbc --dbc-priority later --input session.jsonl
+```
+
+### 9. Send single command frame
 ```bash
 canctl send --id 0x18FF50E5 --ext --data "01 02 03 04 05 06 07 08"
 ```
 
-### 7. Verify DBC decoding without bus
+### 10. Verify DBC decoding without bus
 ```bash
 canctl decode --dbc signals.dbc --input captured.jsonl
 ```
@@ -317,3 +412,5 @@ canctl decode --dbc signals.dbc --input captured.jsonl
 6. On `type: "summary"`, the command has finished.
 7. `--dry-run` produces identical JSON structure — safe for logic testing.
 8. stderr is never used. All output is stdout JSON.
+9. `fd` field only appears when CAN FD is active.
+10. `rate_msg_s` in stats shows real-time message throughput.

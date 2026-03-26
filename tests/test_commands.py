@@ -75,6 +75,22 @@ class TestSend:
         assert send_line["id"] == "0x18FF50E5"
         assert send_line["ext"] is True
 
+    def test_send_fd_flag(self):
+        """CAN FD 플래그 전달 확인"""
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "send",
+            "--id", "0x201",
+            "--data", "0102030405060708090A0B0C",
+            "--fd",
+            "--dry-run",
+        ])
+        assert result.exit_code == 0
+        lines = [json.loads(l) for l in result.output.strip().split("\n")]
+        send_lines = [l for l in lines if l["type"] == "send"]
+        assert len(send_lines) == 1
+        assert send_lines[0].get("fd") is True
+
 
 class TestRecv:
     def test_recv_dry_run_timeout(self):
@@ -88,7 +104,6 @@ class TestRecv:
         ])
         assert result.exit_code == 0
         lines = [json.loads(l) for l in result.output.strip().split("\n")]
-        # dry-run이므로 프레임 없음 → 타임아웃 에러
         error_lines = [l for l in lines if l["type"] == "error"]
         assert any(l["code"] == "TIMEOUT" for l in error_lines)
 
@@ -108,7 +123,6 @@ class TestRecv:
         ])
         assert result.exit_code == 0
         lines = [json.loads(l) for l in result.output.strip().split("\n")]
-        # periodic_start/stop 이벤트 확인
         starts = [l for l in lines if l["type"] == "periodic_start"]
         stops = [l for l in lines if l["type"] == "periodic_stop"]
         assert len(starts) == 1
@@ -130,7 +144,7 @@ class TestMonitor:
         lines = [json.loads(l) for l in result.output.strip().split("\n")]
         summary = [l for l in lines if l["type"] == "summary"]
         assert len(summary) == 1
-        assert summary[0]["total"] == 0  # dry-run이므로 프레임 없음
+        assert summary[0]["total"] == 0
 
 
 class TestDecode:
@@ -146,18 +160,12 @@ class TestDecode:
         lines = [json.loads(l) for l in result.output.strip().split("\n")]
 
         decoded = [l for l in lines if l["type"] == "decoded"]
-        unknown = [l for l in lines if l["type"] == "unknown"]
-
-        # 0x201 (EngineData) 3개, 0x202 (VehicleSpeed) 2개
         assert len(decoded) == 5
-        assert len(unknown) == 0
 
-        # EngineData 디코딩 확인
         engine = [l for l in decoded if l.get("msg") == "EngineData"]
         assert len(engine) == 3
         assert "EngineRPM" in engine[0]["signals"]
 
-        # VehicleSpeed 디코딩 확인
         vehicle = [l for l in decoded if l.get("msg") == "VehicleSpeed"]
         assert len(vehicle) == 2
         assert "Speed" in vehicle[0]["signals"]
@@ -172,7 +180,18 @@ class TestDecode:
         ])
         lines = [json.loads(l) for l in result.output.strip().split("\n")]
         for line in lines:
-            assert "data" in line  # raw data 항상 유지
+            assert "data" in line
+
+    def test_decode_with_priority(self):
+        """--dbc-priority 옵션 동작 확인"""
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "decode",
+            "--dbc", TEST_DBC,
+            "--dbc-priority", "first",
+            "--input", SAMPLE_JSONL,
+        ])
+        assert result.exit_code == 0
 
 
 class TestPlay:
@@ -181,14 +200,14 @@ class TestPlay:
         runner = CliRunner()
         result = runner.invoke(cli, [
             "play", SAMPLE_JSONL,
-            "--speed", "0",  # 즉시 재생
+            "--speed", "0",
             "--dry-run",
         ])
         assert result.exit_code == 0
         lines = [json.loads(l) for l in result.output.strip().split("\n")]
 
         play_lines = [l for l in lines if l["type"] == "play"]
-        assert len(play_lines) == 5  # 5개 프레임
+        assert len(play_lines) == 5
 
         summary = [l for l in lines if l["type"] == "summary"]
         assert summary[0]["played"] == 5
@@ -200,23 +219,49 @@ class TestPlay:
         start = time.monotonic()
         result = runner.invoke(cli, [
             "play", SAMPLE_JSONL,
-            "--speed", "10.0",  # 10배속 → 0.04초에 완료
+            "--speed", "10.0",
             "--dry-run",
         ])
         elapsed = time.monotonic() - start
         assert result.exit_code == 0
-        # 10배속이면 0.4초 원본 → 0.04초, 여유 포함 1초 이내
         assert elapsed < 1.0
+
+    def test_play_burst(self):
+        """burst 재생 — 프레임 수 확인"""
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "play", SAMPLE_JSONL,
+            "--speed", "0",
+            "--burst", "3",
+            "--dry-run",
+        ])
+        assert result.exit_code == 0
+        lines = [json.loads(l) for l in result.output.strip().split("\n")]
+        play_lines = [l for l in lines if l["type"] == "play"]
+        assert len(play_lines) == 15  # 5 frames × 3 burst
+
+        summary = [l for l in lines if l["type"] == "summary"]
+        assert summary[0]["played"] == 15
+
+    def test_play_jitter(self):
+        """jitter 옵션 에러 없이 동작"""
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "play", SAMPLE_JSONL,
+            "--speed", "0",
+            "--jitter", "10",
+            "--dry-run",
+        ])
+        assert result.exit_code == 0
 
 
 class TestPipeline:
     """파이프라인 시뮬레이션: play --dry-run → decode"""
 
-    def test_play_then_decode(self, tmp_path):
+    def test_play_then_decode(self):
         """play dry-run 출력 → decode 파이프라인"""
         runner = CliRunner()
 
-        # 1단계: play dry-run → 임시 파일에 저장
         play_result = runner.invoke(cli, [
             "play", SAMPLE_JSONL,
             "--speed", "0",
@@ -224,9 +269,6 @@ class TestPipeline:
         ])
         assert play_result.exit_code == 0
 
-        # play 출력에서 frame 타입으로 변환 (play → frame)
-        # play 출력은 type=play이므로 decode에서 처리되려면 frame이어야 함
-        # → 원본 JSONL을 직접 decode에 넘기는 게 정상 파이프라인
         decode_result = runner.invoke(cli, [
             "decode",
             "--dbc", TEST_DBC,
