@@ -414,3 +414,115 @@ canctl decode --dbc signals.dbc --input captured.jsonl
 8. stderr is never used. All output is stdout JSON.
 9. `fd` field only appears when CAN FD is active.
 10. `rate_msg_s` in stats shows real-time message throughput.
+
+---
+
+## Remote Execution via FtechEngine
+
+canctl은 FtechEngine의 `diag/exec` API를 통해 원격 장비에서 실행할 수 있다.
+
+### 동작 원리
+
+FtechEngine `diag/exec`는 내부적으로 `cmd /c chcp 65001 >nul && {command}`로 실행하며,
+stdout/stderr를 전체 버퍼링하여 JSON 응답으로 반환한다.
+
+**ExecResponse 스키마:**
+```json
+{
+  "Command": "C:/canctl/canctl.exe send --id 0x201 --data FF3C --dry-run",
+  "ExitCode": 0,
+  "Stdout": "{\"type\":\"send\",...}\n{\"type\":\"summary\",...}\n",
+  "Stderr": ""
+}
+```
+
+### curl 사용 예시
+
+**프레임 송신:**
+```bash
+curl -X POST http://192.168.1.100:5050/api/v1/diag/exec \
+  -H "Content-Type: application/json" \
+  -d '{
+    "command": "canctl send --id 0x201 --data FF3C000000000000 --dry-run",
+    "workingDirectory": "C:/canctl",
+    "timeoutMs": 10000
+  }'
+```
+
+**수신 대기 (timeout 필수):**
+```bash
+curl -X POST http://192.168.1.100:5050/api/v1/diag/exec \
+  -H "Content-Type: application/json" \
+  -d '{
+    "command": "canctl recv --id 0x201 --timeout 5.0 --count 10 --requires \"0x700:00:100ms\"",
+    "workingDirectory": "C:/canctl",
+    "timeoutMs": 30000
+  }'
+```
+
+**버스 모니터링 (duration 필수):**
+```bash
+curl -X POST http://192.168.1.100:5050/api/v1/diag/exec \
+  -H "Content-Type: application/json" \
+  -d '{
+    "command": "canctl monitor --duration 10 --stats-interval 2",
+    "workingDirectory": "C:/canctl",
+    "timeoutMs": 30000
+  }'
+```
+
+**캡처 → 디코드 (2단계 호출):**
+```bash
+# Step 1: 모니터링으로 캡처
+curl -X POST http://192.168.1.100:5050/api/v1/diag/exec \
+  -d '{"command": "canctl monitor --duration 5 --output C:/canctl/session.jsonl", "timeoutMs": 15000}'
+
+# Step 2: 오프라인 디코드
+curl -X POST http://192.168.1.100:5050/api/v1/diag/exec \
+  -d '{"command": "canctl decode --dbc C:/canctl/engine.dbc --input C:/canctl/session.jsonl", "timeoutMs": 10000}'
+```
+
+### 제약사항
+
+| 항목 | 설명 |
+|------|------|
+| 스트리밍 불가 | stdout 전체 버퍼링 → `recv`, `monitor`는 반드시 `--timeout` 또는 `--duration` 지정 |
+| 파이프 불가 | `cmd1 \| cmd2` 파이프라인 사용 불가 → 별도 호출로 대체 |
+| 메모리 주의 | 대량 출력(수천 프레임)은 Stdout 버퍼에 쌓임 → `--count`/`--duration`으로 제한 |
+| timeoutMs 설정 | canctl timeout보다 여유 있게 (canctl 5s → timeoutMs 10000 이상) |
+| SYSTEM 계정 | FtechEngine은 SYSTEM 계정으로 실행 → PCAN USB 드라이버 접근 현장 확인 필요 |
+| 인증 없음 | diag/exec API에 인증 없음 → 네트워크 격리 또는 방화벽 필수 |
+
+### 권장 패턴
+
+1. **송신**: `canctl send --id ID --data DATA [--repeat N]` — 단순, 즉시 완료
+2. **수신**: `canctl recv --id ID --timeout T --count N` — 반드시 종료 조건 지정
+3. **모니터링**: `canctl monitor --duration T --output FILE` — 파일 저장 후 별도 디코드
+4. **디코드**: `canctl decode --dbc DBC --input FILE` — 오프라인, 빠름
+5. **재생**: `canctl play FILE --speed S` — 캡처 파일 기반, 즉시 완료
+
+### ExecResponse 파싱 (Python)
+
+```python
+import json
+import httpx
+
+# diag/exec 호출
+resp = httpx.post("http://192.168.1.100:5050/api/v1/diag/exec", json={
+    "command": "canctl send --id 0x201 --data FF3C --dry-run",
+    "timeoutMs": 10000,
+})
+exec_result = resp.json()
+
+# exit code 확인
+if exec_result["ExitCode"] != 0:
+    print(f"실패: {exec_result['Stderr']}")
+else:
+    # JSONL 줄별 파싱
+    for line in exec_result["Stdout"].strip().split("\n"):
+        record = json.loads(line)
+        if record["type"] == "send":
+            print(f"송신 완료: {record['id']} → {record['data']}")
+        elif record["type"] == "summary":
+            print(f"총 {record['sent']}프레임 송신")
+```
