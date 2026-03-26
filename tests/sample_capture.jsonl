@@ -1,0 +1,5 @@
+{"type":"frame","ts":1710000000.000,"bus":"pcan:PCAN_USBBUS1","id":"0x201","ext":false,"dlc":8,"data":"C80000001E000000"}
+{"type":"frame","ts":1710000000.100,"bus":"pcan:PCAN_USBBUS1","id":"0x202","ext":false,"dlc":4,"data":"E8030200"}
+{"type":"frame","ts":1710000000.200,"bus":"pcan:PCAN_USBBUS1","id":"0x201","ext":false,"dlc":8,"data":"F401000028000000"}
+{"type":"frame","ts":1710000000.300,"bus":"pcan:PCAN_USBBUS1","id":"0x202","ext":false,"dlc":4,"data":"D0070300"}
+{"type":"frame","ts":1710000000.400,"bus":"pcan:PCAN_USBBUS1","id":"0x201","ext":false,"dlc":8,"data":"2003000032000000"}
